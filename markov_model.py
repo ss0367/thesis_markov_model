@@ -2,21 +2,8 @@ import pandas as pd
 import numpy as np
 import os
 
-# ------------- CONFIG ----------------
-INPUT_FILE = "preqin_company_sequences_markov_ready.csv"  # or .xlsx
-OUTPUT_TRANSITION_MATRIX = "markov_transition_matrix.csv"
-# -------------------------------------
-
-
 def load_company_sequences(path):
-    """
-    Load the wide company-level file and extract stage sequences per company.
-
-    Assumes columns:
-      - 'PORTFOLIO COMPANY'
-      - 'PORTFOLIO COMPANY ID'
-      - 'stage_1', 'stage_2', ..., 'stage_K'
-    """
+    
     # Load as CSV or Excel depending on extension
     ext = os.path.splitext(path)[1].lower()
     if ext == ".csv":
@@ -47,21 +34,7 @@ def load_company_sequences(path):
 
 
 def estimate_transition_matrix(sequences, state_order=None, smoothing=0.0):
-    """
-    Given a list of sequences (list of lists of stage strings),
-    estimate the Markov transition probability matrix.
-
-    Parameters:
-      sequences: list of [s1, s2, ..., sT] label sequences
-      state_order: explicit list of states to enforce order; if None, inferred from data
-      smoothing: optional pseudocount (e.g. 1.0 for Laplace), default 0.0
-
-    Returns:
-      states: list of state names
-      counts: array shape (N_states, N_states) of transition counts
-      P:      array shape (N_states, N_states) of transition probabilities
-              where P[i, j] = P(next_state = states[j] | current_state = states[i])
-    """
+    
     # Infer unique states if not provided
     if state_order is None:
         uniq_states = set()
