@@ -1,4 +1,3 @@
-
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
@@ -8,6 +7,8 @@ try:
 except Exception:
     display = print
 
+
+# Configuration
 INPUT_FILE = "preqin_company_sequences_long.csv"
 
 OUT_COUNTS = "hmm_expected_transition_counts.csv"
@@ -120,7 +121,7 @@ def transition_probs_for_time(i: int, x: np.ndarray, params_i: np.ndarray, choic
     if m == 1:
         return np.array([1.0], dtype=float)
 
-    logits = np.zeros(m, dtype=float)  # reference class = choices[0]
+    logits = np.zeros(m, dtype=float)  # Reference class = choices[0]
     for k in range(1, m):
         logits[k] = float(np.dot(params_i[k - 1], x))
     return softmax(logits)
@@ -221,13 +222,10 @@ def compute_absorption_probabilities(P: np.ndarray, exit_idx: int, fail_idx: int
 
 
 def transition_probs_at_size_table(params: dict[int, np.ndarray], r_mu: float, r_sd: float) -> pd.DataFrame:
-    """
-    Create a table of P(next_state | current_state, size) for selected sizes.
-    Uses miss=0.
-    """
+    """Compute P(next_state | current_state, size) at selected deal sizes."""
     rows = []
     for size in SIZE_POINTS_USD_MN:
-        r = np.log1p(size)  # log_raise in USD MN space (matching preprocessing)
+        r = np.log1p(size)
         r_std = 0.0 if r_sd < 1e-8 else (r - r_mu) / r_sd
         x = np.array([1.0, float(r_std), 0.0], dtype=float)
 
@@ -246,200 +244,298 @@ def transition_probs_at_size_table(params: dict[int, np.ndarray], r_mu: float, r
     return pd.DataFrame(rows)
 
 
-def main():
-    np.random.seed(RANDOM_SEED)
+def transition_matrices_by_size(df_size: pd.DataFrame) -> dict[float, pd.DataFrame]:
+    """Convert size-conditioned transition probabilities into matrices."""
+    matrices = {}
+    for size in sorted(df_size["deal_size_usd_mn"].unique()):
+        sub = df_size[df_size["deal_size_usd_mn"] == size].copy()
 
-    df = pd.read_csv(INPUT_FILE)
-    required = ["company_id", "t", "obs_token", "log_raise"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Input missing required columns: {missing}")
+        mat = sub.pivot_table(
+            index="from_state",
+            columns="to_state",
+            values="prob",
+            aggfunc="first"
+        ).fillna(0.0)
 
-    df = df.sort_values(["company_id", "t"], kind="mergesort").reset_index(drop=True)
+        # Enforce row and column order
+        mat = mat.reindex(index=PROGRESSION_STATES, columns=STATES, fill_value=0.0)
 
-    obs_vocab = sorted(df["obs_token"].astype(str).unique().tolist())
-    obs_index = {o: k for k, o in enumerate(obs_vocab)}
-    df["obs_idx"] = df["obs_token"].map(obs_index).astype(int)
+        matrices[size] = mat
 
-    r_std, r_mu, r_sd = standardize_feature(df)
-    miss = (~np.isfinite(df["log_raise"].to_numpy())).astype(float)
-    df["r_std"] = r_std
-    df["r_miss"] = miss
+    return matrices
 
-    sequences = []
-    for cid, g in df.groupby("company_id", sort=False):
-        sequences.append((
-            int(cid),
-            g["obs_idx"].to_numpy(dtype=int),
-            g["r_std"].to_numpy(dtype=float),
-            g["r_miss"].to_numpy(dtype=float),
-        ))
 
+np.random.seed(RANDOM_SEED)
+
+TERMINAL_FAIL_MIDPOINT_DAYS = 730.0
+TERMINAL_FAIL_LOG_SCALE = 0.50
+TERMINAL_FAIL_WEIGHT = 0.15
+
+
+def fixed_terminal_fail_prob(delta_days: float, last_obs_idx: int, obs_vocab: list[str]) -> float:
+    """Map the final observation gap to a terminal failure probability."""
+    if obs_vocab[last_obs_idx] == "EXITLIKE":
+        return 0.0
+    if not np.isfinite(delta_days):
+        return 0.0
+
+    z = (np.log1p(float(delta_days)) - np.log1p(TERMINAL_FAIL_MIDPOINT_DAYS)) / TERMINAL_FAIL_LOG_SCALE
+    z = float(np.clip(z, -30, 30))
+    return 1.0 / (1.0 + np.exp(-z))
+
+
+def build_terminal_pseudo_xi(gamma_last: np.ndarray, q_fail: float, allowed_next: dict[int, list[int]]) -> np.ndarray:
+    """Create a pseudo-transition after the final observed financing round."""
     n_states = len(STATES)
-    n_obs = len(obs_vocab)
+    xi_terminal = np.zeros((n_states, n_states), dtype=float)
 
-    B = initialize_emissions(obs_vocab)
-    pi = initialize_pi()
+    exit_idx = STATE_INDEX["Exit"]
+    fail_idx = STATE_INDEX["Fail"]
 
-    p = 3
-    params = {}
     for i in range(n_states):
-        m_i = len(ALLOWED_NEXT[i])
-        params[i] = np.zeros((max(m_i - 1, 0), p), dtype=float)
-
-    prev_ll = None
-    for it in range(1, MAX_ITER + 1):
-        pi_acc = np.zeros(n_states, dtype=float)
-        emiss_counts = np.zeros((n_states, n_obs), dtype=float)
-        xi_total = np.zeros((n_states, n_states), dtype=float)
-        ll_total = 0.0
-
-        trans_X = {i: [] for i in range(n_states)}
-        trans_W = {i: [] for i in range(n_states)}
-
-        for _, obs_seq, r_seq, m_seq in sequences:
-            T = len(obs_seq)
-            if T == 0:
-                continue
-
-            A_list = build_transition_matrices_for_sequence(r_seq, m_seq, params)
-            logB = np.log(np.maximum(B[:, obs_seq], 1e-300))
-            log_pi = np.log(np.maximum(pi, 1e-300))
-
-            log_alpha = np.full((T, n_states), -np.inf)
-            log_alpha[0, :] = log_pi + logB[:, 0]
-
-            for t in range(1, T):
-                logA = np.log(np.maximum(A_list[t - 1], 1e-300))
-                tmp = log_alpha[t - 1, :][:, None] + logA
-                log_alpha[t, :] = logB[:, t] + logsumexp(tmp, axis=0)
-
-            loglik = float(logsumexp(log_alpha[T - 1, :], axis=0))
-            ll_total += loglik
-
-            log_beta = np.full((T, n_states), -np.inf)
-            log_beta[T - 1, :] = 0.0
-            for t in range(T - 2, -1, -1):
-                logA = np.log(np.maximum(A_list[t], 1e-300))
-                tmp = logA + (logB[:, t + 1] + log_beta[t + 1, :])[None, :]
-                log_beta[t, :] = logsumexp(tmp, axis=1)
-
-            log_gamma = log_alpha + log_beta - loglik
-            gamma = np.exp(log_gamma)
-
-            pi_acc += gamma[0, :]
-            for t in range(T):
-                emiss_counts[:, obs_seq[t]] += gamma[t, :]
-
-            for t in range(1, T):
-                logA = np.log(np.maximum(A_list[t - 1], 1e-300))
-                log_xi = (
-                    log_alpha[t - 1, :][:, None]
-                    + logA
-                    + logB[:, t][None, :]
-                    + log_beta[t, :][None, :]
-                    - loglik
-                )
-                xi = np.exp(log_xi)
-                xi_total += xi
-
-                x_t = np.array([1.0, float(r_seq[t]), float(m_seq[t])], dtype=float)
-                for i in range(n_states):
-                    choices = ALLOWED_NEXT[i]
-                    if len(choices) <= 1:
-                        continue
-                    w = np.array([xi[i, j] for j in choices], dtype=float)
-                    if w.sum() > 1e-12:
-                        trans_X[i].append(x_t)
-                        trans_W[i].append(w)
-
-        # M-step
-        pi = np.maximum(pi_acc, 1e-300)
-        pi = pi / pi.sum()
-
-        B = emiss_counts + EMISSION_DIRICHLET
-        B = B / B.sum(axis=1, keepdims=True)
-
-        for i in range(n_states):
-            if len(ALLOWED_NEXT[i]) <= 1:
-                continue
-            X_i = np.array(trans_X[i], dtype=float)
-            W_i = np.array(trans_W[i], dtype=float)
-            if X_i.shape[0] == 0:
-                continue
-            params[i] = fit_weighted_multinomial_logit(X_i, W_i, ridge_l2=RIDGE_L2)
-
-        if VERBOSE:
-            print(f"EM iter {it:02d} | total log-likelihood: {ll_total:,.3f}")
-
-        if prev_ll is not None and abs(ll_total - prev_ll) < TOL * (1.0 + abs(prev_ll)):
-            if VERBOSE:
-                print("Converged.")
-            break
-        prev_ll = ll_total
-
-    # Expected transition matrices
-    counts = xi_total
-    probs = counts / np.maximum(counts.sum(axis=1, keepdims=True), 1e-300)
-
-    df_counts = pd.DataFrame(counts, index=STATES, columns=STATES)
-    df_probs  = pd.DataFrame(probs,  index=STATES, columns=STATES)
-    df_emiss  = pd.DataFrame(B, index=STATES, columns=sorted(obs_vocab))
-    df_pi     = pd.DataFrame({"state": STATES, "pi": pi})
-    df_abs    = compute_absorption_probabilities(probs, STATE_INDEX["Exit"], STATE_INDEX["Fail"])
-
-    # Size-conditioned transition table
-    df_size = transition_probs_at_size_table(params, r_mu=r_mu, r_sd=r_sd)
-
-    print("\n=== Expected Transition COUNT Matrix (posterior-weighted) ===")
-    display(df_counts.style.format("{:,.2f}"))
-
-    print("\n=== Expected Transition PROBABILITY Matrix (row-normalized) ===")
-    display(df_probs.style.format("{:.4f}"))
-
-    print("\n=== Absorption Probabilities (from marginal transition matrix) ===")
-    display(df_abs.style.format({"prob_absorb_exit": "{:.4f}", "prob_absorb_fail": "{:.4f}"}))
-
-    print("\n=== Transition probabilities at specific deal sizes (USD MN) ===")
-    # Pivot into a compact view: rows = from_state + size, columns = to_state
-    pivot = df_size.pivot_table(index=["from_state", "deal_size_usd_mn"], columns="to_state", values="prob", aggfunc="first").fillna(0.0)
-    display(pivot.style.format("{:.4f}"))
-
-    print("\n=== Emission Probabilities P(obs_token | state) ===")
-    display(df_emiss.style.format("{:.4f}"))
-
-    df_counts.to_csv(OUT_COUNTS)
-    df_probs.to_csv(OUT_PROBS)
-    df_emiss.to_csv(OUT_EMISS)
-    df_pi.to_csv(OUT_PI, index=False)
-    df_abs.to_csv(OUT_ABSORB, index=False)
-    df_size.to_csv(OUT_SIZE_TABLE, index=False)
-
-    # Save transition logit parameters
-    feature_names = ["intercept", "r_std", "r_missing"]
-    rows = []
-    for i in range(len(STATES)):
-        choices = ALLOWED_NEXT[i]
-        if len(choices) <= 1:
+        mass = float(gamma_last[i])
+        if mass <= 0:
             continue
-        ref = choices[0]
-        Theta = params[i]
-        for k in range(1, len(choices)):
-            j = choices[k]
-            for f in range(3):
-                rows.append({
-                    "from_state": STATES[i],
-                    "to_state": STATES[j],
-                    "reference_to_state": STATES[ref],
-                    "feature": feature_names[f],
-                    "coef": float(Theta[k - 1, f]),
-                })
-    pd.DataFrame(rows).to_csv(OUT_PARAMS, index=False)
 
-    print("\nSaved output CSVs:")
-    for f in [OUT_COUNTS, OUT_PROBS, OUT_EMISS, OUT_PARAMS, OUT_PI, OUT_ABSORB, OUT_SIZE_TABLE]:
-        print(" -", f)
+        if i == exit_idx:
+            xi_terminal[i, exit_idx] = mass
+        elif i == fail_idx:
+            xi_terminal[i, fail_idx] = mass
+        else:
+            xi_terminal[i, i] = mass * (1.0 - q_fail)
+            if fail_idx in allowed_next[i]:
+                xi_terminal[i, fail_idx] = mass * q_fail
+
+    return xi_terminal
 
 
-if __name__ == "__main__":
-    main()
+df = pd.read_csv(INPUT_FILE)
+required = ["company_id", "t", "obs_token", "log_raise", "delta_days"]
+missing = [c for c in required if c not in df.columns]
+if missing:
+    raise ValueError(f"Input missing required columns: {missing}")
+
+df = df.sort_values(["company_id", "t"], kind="mergesort").reset_index(drop=True)
+
+obs_vocab = sorted(df["obs_token"].astype(str).unique().tolist())
+obs_index = {o: k for k, o in enumerate(obs_vocab)}
+df["obs_idx"] = df["obs_token"].map(obs_index).astype(int)
+
+r_std, r_mu, r_sd = standardize_feature(df)
+miss = (~np.isfinite(df["log_raise"].to_numpy())).astype(float)
+df["r_std"] = r_std
+df["r_miss"] = miss
+df["delta_days"] = pd.to_numeric(df["delta_days"], errors="coerce")
+
+sequences = []
+for cid, g in df.groupby("company_id", sort=False):
+    sequences.append((
+        int(cid),
+        g["obs_idx"].to_numpy(dtype=int),
+        g["r_std"].to_numpy(dtype=float),
+        g["r_miss"].to_numpy(dtype=float),
+        g["delta_days"].to_numpy(dtype=float),
+    ))
+
+n_states = len(STATES)
+n_obs = len(obs_vocab)
+
+B = initialize_emissions(obs_vocab)
+pi = initialize_pi()
+
+p = 3
+params = {}
+for i in range(n_states):
+    m_i = len(ALLOWED_NEXT[i])
+    params[i] = np.zeros((max(m_i - 1, 0), p), dtype=float)
+
+prev_ll = None
+for it in range(1, MAX_ITER + 1):
+    pi_acc = np.zeros(n_states, dtype=float)
+    emiss_counts = np.zeros((n_states, n_obs), dtype=float)
+    xi_total = np.zeros((n_states, n_states), dtype=float)
+    ll_total = 0.0
+
+    trans_X = {i: [] for i in range(n_states)}
+    trans_W = {i: [] for i in range(n_states)}
+
+    for _, obs_seq, r_seq, m_seq, gap_seq in sequences:
+        T = len(obs_seq)
+        if T == 0:
+            continue
+
+        A_list = build_transition_matrices_for_sequence(r_seq, m_seq, params)
+        logB = np.log(np.maximum(B[:, obs_seq], 1e-300))
+        log_pi = np.log(np.maximum(pi, 1e-300))
+
+        log_alpha = np.full((T, n_states), -np.inf)
+        log_alpha[0, :] = log_pi + logB[:, 0]
+
+        for t in range(1, T):
+            logA = np.log(np.maximum(A_list[t - 1], 1e-300))
+            tmp = log_alpha[t - 1, :][:, None] + logA
+            log_alpha[t, :] = logB[:, t] + logsumexp(tmp, axis=0)
+
+        loglik = float(logsumexp(log_alpha[T - 1, :], axis=0))
+        ll_total += loglik
+
+        log_beta = np.full((T, n_states), -np.inf)
+        log_beta[T - 1, :] = 0.0
+        for t in range(T - 2, -1, -1):
+            logA = np.log(np.maximum(A_list[t], 1e-300))
+            tmp = logA + (logB[:, t + 1] + log_beta[t + 1, :])[None, :]
+            log_beta[t, :] = logsumexp(tmp, axis=1)
+
+        log_gamma = log_alpha + log_beta - loglik
+        gamma = np.exp(log_gamma)
+
+        pi_acc += gamma[0, :]
+        for t in range(T):
+            emiss_counts[:, obs_seq[t]] += gamma[t, :]
+
+        for t in range(1, T):
+            logA = np.log(np.maximum(A_list[t - 1], 1e-300))
+            log_xi = (
+                log_alpha[t - 1, :][:, None]
+                + logA
+                + logB[:, t][None, :]
+                + log_beta[t, :][None, :]
+                - loglik
+            )
+            xi = np.exp(log_xi)
+            xi_total += xi
+
+            x_t = np.array([1.0, float(r_seq[t]), float(m_seq[t])], dtype=float)
+            for i in range(n_states):
+                choices = ALLOWED_NEXT[i]
+                if len(choices) <= 1:
+                    continue
+                w = np.array([xi[i, j] for j in choices], dtype=float)
+                if w.sum() > 1e-12:
+                    trans_X[i].append(x_t)
+                    trans_W[i].append(w)
+
+        # Terminal pseudo-transition from the final observed row
+        gap_last = float(gap_seq[-1]) if T > 0 else np.nan
+        q_fail = fixed_terminal_fail_prob(
+            delta_days=gap_last,
+            last_obs_idx=int(obs_seq[-1]),
+            obs_vocab=obs_vocab
+        )
+
+        gamma_last = gamma[-1, :]
+        xi_terminal = build_terminal_pseudo_xi(gamma_last, q_fail, ALLOWED_NEXT)
+        xi_terminal *= TERMINAL_FAIL_WEIGHT
+
+        # Add terminal pseudo-transition to expected counts
+        xi_total += xi_terminal
+
+        # Include terminal pseudo-transition in the transition M-step
+        x_terminal = np.array([1.0, float(r_seq[-1]), float(m_seq[-1])], dtype=float)
+        for i in range(n_states):
+            choices = ALLOWED_NEXT[i]
+            if len(choices) <= 1:
+                continue
+            w = np.array([xi_terminal[i, j] for j in choices], dtype=float)
+            if w.sum() > 1e-12:
+                trans_X[i].append(x_terminal)
+                trans_W[i].append(w)
+
+    # M-step updates
+    pi = np.maximum(pi_acc, 1e-300)
+    pi = pi / pi.sum()
+
+    B = emiss_counts + EMISSION_DIRICHLET
+    B = B / B.sum(axis=1, keepdims=True)
+
+    for i in range(n_states):
+        if len(ALLOWED_NEXT[i]) <= 1:
+            continue
+        X_i = np.array(trans_X[i], dtype=float)
+        W_i = np.array(trans_W[i], dtype=float)
+        if X_i.shape[0] == 0:
+            continue
+        params[i] = fit_weighted_multinomial_logit(X_i, W_i, ridge_l2=RIDGE_L2)
+
+    if VERBOSE:
+        print(f"EM iter {it:02d} | total log-likelihood: {ll_total:,.3f}")
+
+    if prev_ll is not None and abs(ll_total - prev_ll) < TOL * (1.0 + abs(prev_ll)):
+        if VERBOSE:
+            print("Converged.")
+        break
+    prev_ll = ll_total
+
+# Expected transition matrices
+counts = xi_total
+probs = counts / np.maximum(counts.sum(axis=1, keepdims=True), 1e-300)
+
+df_counts = pd.DataFrame(counts, index=STATES, columns=STATES)
+df_probs  = pd.DataFrame(probs,  index=STATES, columns=STATES)
+df_emiss  = pd.DataFrame(B, index=STATES, columns=sorted(obs_vocab))
+df_pi     = pd.DataFrame({"state": STATES, "pi": pi})
+df_abs    = compute_absorption_probabilities(probs, STATE_INDEX["Exit"], STATE_INDEX["Fail"])
+
+# Size-conditioned transition table
+df_size = transition_probs_at_size_table(params, r_mu=r_mu, r_sd=r_sd)
+size_matrices = transition_matrices_by_size(df_size)
+
+# Display results
+print("\n=== Expected Transition COUNT Matrix (posterior-weighted) ===")
+display(df_counts.style.format("{:,.2f}"))
+
+print("\n=== Expected Transition PROBABILITY Matrix (row-normalized) ===")
+display(df_probs.style.format("{:.4f}"))
+
+print("\n=== Absorption Probabilities (from marginal transition matrix) ===")
+display(df_abs.style.format({"prob_absorb_exit": "{:.4f}", "prob_absorb_fail": "{:.4f}"}))
+
+print("\n=== Transition probabilities at specific deal sizes (USD MN) ===")
+pivot = df_size.pivot_table(index=["from_state", "deal_size_usd_mn"], columns="to_state", values="prob", aggfunc="first").fillna(0.0)
+display(pivot.style.format("{:.4f}"))
+
+print("\n=== Emission Probabilities P(obs_token | state) ===")
+display(df_emiss.style.format("{:.4f}"))
+
+print("\n=== Transition Matrices at Specific Deal Sizes ===")
+for size, mat in size_matrices.items():
+    print(f"\n--- Deal size = ${size:.0f}M ---")
+    display(mat.style.format("{:.4f}"))
+
+# Save outputs
+df_counts.to_csv(OUT_COUNTS)
+df_probs.to_csv(OUT_PROBS)
+df_emiss.to_csv(OUT_EMISS)
+df_pi.to_csv(OUT_PI, index=False)
+df_abs.to_csv(OUT_ABSORB, index=False)
+df_size.to_csv(OUT_SIZE_TABLE, index=False)
+
+for size, mat in size_matrices.items():
+    filename = f"hmm_transition_matrix_{int(size)}M.csv"
+    mat.to_csv(filename)
+    print(" -", filename)
+
+# Save transition logit parameters
+feature_names = ["intercept", "r_std", "r_missing"]
+rows = []
+for i in range(len(STATES)):
+    choices = ALLOWED_NEXT[i]
+    if len(choices) <= 1:
+        continue
+    ref = choices[0]
+    Theta = params[i]
+    for k in range(1, len(choices)):
+        j = choices[k]
+        for f in range(3):
+            rows.append({
+                "from_state": STATES[i],
+                "to_state": STATES[j],
+                "reference_to_state": STATES[ref],
+                "feature": feature_names[f],
+                "coef": float(Theta[k - 1, f]),
+            })
+pd.DataFrame(rows).to_csv(OUT_PARAMS, index=False)
+
+print("\nSaved output CSVs:")
+for f in [OUT_COUNTS, OUT_PROBS, OUT_EMISS, OUT_PARAMS, OUT_PI, OUT_ABSORB, OUT_SIZE_TABLE]:
+    print(" -", f)
